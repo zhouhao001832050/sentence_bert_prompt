@@ -189,11 +189,71 @@ def evaluate(args, model, tokenizer, prefix=""):
             print(" dev: %s = %s", key, str(result[key]))
     return results
 
+def predict(args, model, tokenizer, label_map, prefix=""):
+    pred_task_names = (args.task_name,)
+    pred_outputs_dirs = (args.output_dir,)
+    # label_map = {i: label for i, label in enumerate(label_list)}
+
+    for pred_task, pred_output_dir in zip(pred_task_names, pred_outputs_dirs):
+        pred_dataset = load_and_cache_examples(args, pred_task, tokenizer, data_type='dev')
+        if not os.path.exists(pred_output_dir) and args.local_rank in [-1, 0]:
+            os.makedirs(pred_output_dir)
+
+        args.pred_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+        # Note that DistributedSampler samples randomly
+        pred_sampler = SequentialSampler(pred_dataset) if args.local_rank == -1 else DistributedSampler(pred_dataset)
+        pred_dataloader = DataLoader(pred_dataset, sampler=pred_sampler, batch_size=args.pred_batch_size,
+                                     collate_fn=xlnet_collate_fn
+                                     if args.model_type in ['xlnet'] else collate_fn)
+
+        logger.info("******** Running prediction {} ********".format(prefix))
+        logger.info("  Num examples = %d", len(pred_dataset))
+        logger.info("  Batch size = %d", args.pred_batch_size)
+        nb_pred_steps = 0
+        preds = None
+        pbar = ProgressBar(n_total=len(pred_dataloader), desc="Predicting")
+        for step, batch in enumerate(pred_dataloader):
+            model.eval()
+            batch = tuple(t.to(args.device) for t in batch)
+            with torch.no_grad():
+                inputs = {'input_ids': batch[0],
+                          'attention_mask': batch[1],
+                          'labels': batch[3]}
+                if args.model_type != 'distilbert':
+                    inputs['token_type_ids'] = batch[2] if (
+                            'bert' in args.model_type or 'xlnet' in args.model_type) else None  # XLM, DistilBERT and RoBERTa don't use segment_ids
+                outputs = model(**inputs)
+                _, logits = outputs[:2]
+            nb_pred_steps += 1
+            if preds is None:
+                preds = logits.detach().cpu().numpy()
+            else:
+                preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
+            pbar(step)
+        print(' ')
+        predict_label = np.argmax(preds, axis=1)
+        output_logits_file = os.path.join(pred_output_dir, prefix, "dev_logits")
+        # 保存中间预测结果
+        save_numpy(file_path=output_logits_file, data=preds)
+
+    outputs_submit_file = str(args.output_dir / "dev_submit.xlsx")
+    test_text = []
+    with open(str(args.data_dir / 'dev.json'), 'r') as fr:
+        for line in fr:
+            test_text.append(json.loads(line))
+    test_submit = []
+    for x, y in zip(test_text, predict_label):
+        json_d = {}
+        json_d["query"] = x['sentence']
+        json_d["prediction"] = str(label_map[str(y)])
+        json_d["label"] = str(label_map[x['label']])
+        json_d["answer"] = "True " if json_d["prediction"] == json_d["label"] else "False"
+        test_submit.append(json_d)
+    df = pd.DataFrame(test_submit)
+    df.to_excel(outputs_submit_file, index=False)
 
 
 
-def predict():
-    pass
 
 
 def load_and_cache_examples(args, task, tokenizer, data_type="train"):
@@ -340,7 +400,23 @@ def main():
         model = model_class.from_pretrained(args.output_dir)
         tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
         model.to(args.device)
-    
+        results = {}
+        
+    if args.do_eval and args.local_rank in [-1, 0]:
+        result = evaluate(args, model, tokenizer, label_map,prefix="")
+        results.update(result)
+        output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
+        with open(output_eval_file, "w") as writer:
+            for key in sorted(results.keys()):
+                writer.write("%s = %s\n" % (key, str(results[key])))
+
+    if args.do_predict and args.local_rank in [-1, 0]:
+        tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
+        model = model_class.from_pretrained(args.output_dir)
+        model.to(args.device)
+        predict(args, model, tokenizer, label_map, prefix="")
+
+
 
 if __name__ == "__main__":
     main()

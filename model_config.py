@@ -8,4 +8,4 @@ dev_path = data_dir / 'dev.json'
 test_path = data_dir / 'test.json'
 output_dir = Path('./outputs')
 
-pretrain_path = "bert-base-chinese"
+pretrain_path = "pretrain_model/bert-base-chinese"
